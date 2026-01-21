@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "meg2bids: MEG to BIDS Converter"
+version: 1.0.0
+date-released: 2026-01-21
+authors:
+  - family-names: "Vandermiers"
+    given-names: "Quentin"
+    email: "quentin.vandermiers@ulb.be"
+    orcid: "https://orcid.org/0009-0001-6952-7498"
+repository-code: "https://github.com/ln2t/meg2bids"
+url: "https://github.com/ln2t/meg2bids"
+license: GPL-3.0
+keywords:
+  - MEG
+  - BIDS
+  - neuroimaging
+  - neuroscience
+  - MNE
+  - FIF
+  - Neuromag
+  - Elekta
+  - MEGIN
+abstract: >
+  meg2bids is a tool for converting MEG FIF files from Neuromag/Elekta/MEGIN
+  systems into the Brain Imaging Data Structure (BIDS) format. It provides
+  automatic detection of MaxFilter derivatives, calibration file management,
+  and comprehensive validation tools.

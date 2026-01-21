@@ -1,0 +1,15 @@
+# meg2bids requirements
+# Core dependencies for MEG to BIDS conversion
+
+# MNE ecosystem
+mne>=1.0
+mne-bids>=0.13
+
+# Scientific computing
+numpy>=1.20
+
+# Standard library enhancements (no additional installs needed for Python 3.8+)
+# pathlib - built-in
+# json - built-in
+# argparse - built-in
+# logging - built-in

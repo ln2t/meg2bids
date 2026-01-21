@@ -1,0 +1,17 @@
+# Development requirements for meg2bids
+
+# Testing
+pytest>=7.0
+pytest-cov>=3.0
+pytest-mock>=3.0
+
+# Code quality
+black>=22.0
+flake8>=4.0
+pylint>=2.0
+mypy>=0.950
+
+# Documentation
+mkdocs>=1.4
+mkdocs-material>=9.0
+mkdocstrings>=0.20

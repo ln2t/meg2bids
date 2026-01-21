@@ -1,0 +1,5 @@
+participant_id	meg_id	age	sex	group
+sub-01	1001	25	F	control
+sub-02	1002	28	M	control
+sub-03	1003	32	F	patient
+sub-04	1004	29	M	patient

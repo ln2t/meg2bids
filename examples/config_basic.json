@@ -1,0 +1,45 @@
+{
+  "dataset": {
+    "dataset_name": "Example_Study",
+    "datatype": "meg"
+  },
+  "file_patterns": [
+    {
+      "pattern": "*rest*.fif",
+      "task": "rest",
+      "run_extraction": "last_digits",
+      "description": "Resting state recording"
+    },
+    {
+      "pattern": "*chessboard*.fif",
+      "task": "visual",
+      "run_extraction": "last_digits",
+      "description": "Visual checkerboard task"
+    },
+    {
+      "pattern": "*auditory*.fif",
+      "task": "auditory",
+      "run_extraction": "last_digits",
+      "description": "Auditory oddball task"
+    },
+    {
+      "pattern": "*motor*.fif",
+      "task": "motor",
+      "run_extraction": "last_digits",
+      "description": "Motor task"
+    }
+  ],
+  "calibration": {
+    "system": "triux",
+    "auto_detect": true,
+    "maxfilter_root": "MEG/maxfilter"
+  },
+  "derivatives": {
+    "pipeline_name": "maxfilter",
+    "maxfilter_version": "v2.2.20"
+  },
+  "options": {
+    "allow_maxshield": true,
+    "overwrite": true
+  }
+}
