@@ -98,6 +98,103 @@ def test_run_extraction():
     assert extract_run_from_filename("rest2-1.fif", "last_digits") == 2
 
 
+def test_eeg_detection():
+    """Test EEG channel detection from FIF file."""
+    import mne
+    import numpy as np
+    from meg2bids.meg2bids import extract_eeg_information
+    
+    # Create a mock raw object with EEG channels
+    info = mne.create_info(
+        ch_names=['MEG0111', 'MEG0112', 'EEG001', 'EEG002', 'EEG003'],
+        sfreq=250,
+        ch_types=['grad', 'grad', 'eeg', 'eeg', 'eeg']
+    )
+    
+    # Set channel locations
+    info['chs'][2]['loc'][:3] = [0.001, 0.002, 0.003]  # EEG001
+    info['chs'][3]['loc'][:3] = [-0.001, 0.002, 0.003]  # EEG002
+    info['chs'][4]['loc'][:3] = [0.000, -0.002, 0.003]  # EEG003
+    
+    raw = mne.io.RawArray(np.zeros((5, 1000)), info)
+    
+    # Test EEG detection
+    eeg_data = extract_eeg_information(raw)
+    
+    assert eeg_data is not None
+    assert len(eeg_data['name']) == 3
+    assert eeg_data['name'] == ['EEG001', 'EEG002', 'EEG003']
+    assert len(eeg_data['x']) == 3
+    assert len(eeg_data['y']) == 3
+    assert len(eeg_data['z']) == 3
+    assert len(eeg_data['size']) == 3
+    
+    # Check coordinate values
+    assert np.isclose(eeg_data['x'][0], 0.001)
+    assert np.isclose(eeg_data['y'][0], 0.002)
+    assert np.isclose(eeg_data['z'][0], 0.003)
+
+
+def test_eeg_not_detected():
+    """Test behavior when no EEG channels are present."""
+    import mne
+    import numpy as np
+    from meg2bids.meg2bids import extract_eeg_information
+    
+    # Create a mock raw object with only MEG channels
+    info = mne.create_info(
+        ch_names=['MEG0111', 'MEG0112', 'MEG0113'],
+        sfreq=250,
+        ch_types=['grad', 'grad', 'grad']
+    )
+    
+    raw = mne.io.RawArray(np.zeros((3, 1000)), info)
+    
+    # Test that no EEG data is returned
+    eeg_data = extract_eeg_information(raw)
+    assert eeg_data is None
+
+
+def test_electrodes_tsv_creation(tmp_path):
+    """Test electrodes.tsv file creation with proper BIDS naming."""
+    from meg2bids.meg2bids import write_electrodes_tsv
+    import csv
+    
+    # Create mock EEG data
+    eeg_data = {
+        'name': ['EEG001', 'EEG002', 'EEG003'],
+        'x': [0.001, -0.001, 0.000],
+        'y': [0.002, 0.002, -0.002],
+        'z': [0.003, 0.003, 0.003],
+        'size': [0.005, 0.005, 0.005]
+    }
+    
+    bids_root = tmp_path / "bids"
+    
+    # Test without session
+    write_electrodes_tsv(eeg_data, '01', None, bids_root)
+    
+    electrodes_file = bids_root / "sub-01" / "meg" / "sub-01_electrodes.tsv"
+    assert electrodes_file.exists()
+    
+    # Read and verify TSV content
+    with open(electrodes_file, 'r') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        rows = list(reader)
+    
+    assert len(rows) == 3
+    assert rows[0]['name'] == 'EEG001'
+    assert float(rows[0]['x']) == 0.001
+    assert float(rows[0]['y']) == 0.002
+    assert float(rows[0]['z']) == 0.003
+    
+    # Test with session
+    write_electrodes_tsv(eeg_data, '02', '01', bids_root)
+    
+    electrodes_file_session = bids_root / "sub-02" / "ses-01" / "meg" / "sub-02_ses-01_electrodes.tsv"
+    assert electrodes_file_session.exists()
+
+
 def test_pattern_matching():
     """Test file pattern matching."""
     from meg2bids.meg2bids import match_file_pattern

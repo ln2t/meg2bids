@@ -763,6 +763,115 @@ def ensure_derivatives_description(deriv_root: Path, pipeline_name: str, pipelin
     dd.write_text(json.dumps(payload, indent=2))
 
 
+def extract_eeg_information(raw: mne.io.BaseRaw) -> Optional[Dict[str, List[Any]]]:
+    """
+    Extract EEG channel information from FIF file for electrodes.tsv.
+    
+    Returns a dictionary with lists of electrode information:
+    {
+        'name': [...],      # EEG channel names
+        'x': [...],         # X coordinates (in meters, MEG device frame)
+        'y': [...],         # Y coordinates
+        'z': [...],         # Z coordinates
+        'size': [...]       # Electrode size (optional, in meters)
+    }
+    
+    Returns None if no EEG channels found.
+    """
+    # Get EEG channel indices
+    eeg_indices = mne.pick_types(raw.info, eeg=True, exclude=[])
+    
+    if len(eeg_indices) == 0:
+        return None
+    
+    eeg_data = {
+        'name': [],
+        'x': [],
+        'y': [],
+        'z': [],
+        'size': []
+    }
+    
+    for idx in eeg_indices:
+        ch_info = raw.info['chs'][idx]
+        
+        # Channel name
+        eeg_data['name'].append(ch_info['ch_name'])
+        
+        # Channel location in device coordinates (in meters)
+        # loc[0:3] contains the electrode position
+        loc = ch_info['loc'][:3]
+        eeg_data['x'].append(loc[0])
+        eeg_data['y'].append(loc[1])
+        eeg_data['z'].append(loc[2])
+        
+        # Electrode size (optional, in meters)
+        # Default to a reasonable size if not specified
+        size = ch_info.get('size', 0.005)  # Default 5mm if not specified
+        eeg_data['size'].append(size)
+    
+    return eeg_data
+
+
+def write_electrodes_tsv(eeg_data: Dict[str, List[Any]], subject: str, session: Optional[str], bids_root: Path, datatype: str = 'meg') -> None:
+    """
+    Write electrodes.tsv file for simultaneous MEG/EEG recording.
+    
+    BIDS naming: sub-<label>[_ses-<label>]_electrodes.tsv
+    Location: sub-<label>[_ses-<label>]/meg/
+    
+    The electrodes are stored in MEG device coordinates (device frame).
+    
+    Args:
+        eeg_data: Dictionary with 'name', 'x', 'y', 'z', 'size' lists
+        subject: Subject label (e.g., '01', 'HC01')
+        session: Session label (e.g., '01') or None
+        bids_root: Root BIDS directory
+        datatype: Data type directory (default 'meg')
+    """
+    import csv
+    
+    # Determine the MEG directory
+    if session:
+        meg_dir = bids_root / f"sub-{subject}" / f"ses-{session}" / datatype
+    else:
+        meg_dir = bids_root / f"sub-{subject}" / datatype
+    
+    meg_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Build filename: sub-<label>[_ses-<label>]_electrodes.tsv
+    fname_parts = [f"sub-{subject}"]
+    if session:
+        fname_parts.append(f"ses-{session}")
+    fname_parts.append("electrodes.tsv")
+    filename = "_".join(fname_parts)
+    
+    electrodes_file = meg_dir / filename
+    
+    # Write TSV file with proper formatting
+    # BIDS required columns: name, x, y, z
+    # Optional column: size
+    with open(electrodes_file, 'w', newline='') as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=['name', 'x', 'y', 'z', 'size'],
+            delimiter='\t',
+            lineterminator='\n'
+        )
+        writer.writeheader()
+        
+        for i in range(len(eeg_data['name'])):
+            writer.writerow({
+                'name': eeg_data['name'][i],
+                'x': f"{eeg_data['x'][i]:.6f}",
+                'y': f"{eeg_data['y'][i]:.6f}",
+                'z': f"{eeg_data['z'][i]:.6f}",
+                'size': f"{eeg_data['size'][i]:.6f}"
+            })
+    
+    logger.info(f"    → Created electrodes.tsv: {filename} ({len(eeg_data['name'])} EEG channels)")
+
+
 def normalize_raw_info(raw: mne.io.BaseRaw) -> None:
     """Normalize raw.info fields for BIDS compatibility."""
     md = raw.info.get('meas_date')
@@ -829,7 +938,11 @@ def write_derivative_raw(raw: mne.io.BaseRaw, subject: str, session: Optional[st
 
 
 def convert_raw_file(fif_path: Path, subject: str, session: Optional[str], task: str, run: Optional[int], config: BIDSConfig, pattern_rule: Dict[str, Any], bids_root: Path, split_parts: Optional[List[Path]] = None) -> None:
-    """Convert a single raw FIF file to BIDS."""
+    """Convert a single raw FIF file to BIDS.
+    
+    If the FIF file contains EEG channels recorded simultaneously with MEG,
+    also generates electrodes.tsv file with EEG electrode coordinates.
+    """
     datatype = config.get_datatype()
     allow_maxshield = config.get_option('allow_maxshield', True)
     
@@ -860,6 +973,11 @@ def convert_raw_file(fif_path: Path, subject: str, session: Optional[str], task:
             logger.debug(f"    → Saved BIDS file with {len(split_parts)} split parts")
         else:
             logger.debug(f"    → Saved BIDS file: {bids_path.basename}")
+        
+        # Check for simultaneous EEG recording and generate electrodes.tsv if present
+        eeg_data = extract_eeg_information(raw)
+        if eeg_data is not None:
+            write_electrodes_tsv(eeg_data, subject, session, bids_root, datatype)
         
         conversion_stats.add_file(task, 'converted', fif_path.name)
         

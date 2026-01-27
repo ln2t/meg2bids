@@ -12,6 +12,7 @@ Your friendly MEG to BIDS converter.
 `meg2bids` is designed specifically for **Neuromag/Elekta/MEGIN MEG systems** that produce FIF (`.fif`) files. It handles:
 
 - ✅ Raw MEG FIF files conversion to BIDS
+- ✅ Simultaneous MEG/EEG recording support with automatic `electrodes.tsv` generation
 - ✅ Automatic MaxFilter derivative detection and organization
 - ✅ Split file support (files > 2GB)
 - ✅ Calibration file management (crosstalk and fine-calibration)

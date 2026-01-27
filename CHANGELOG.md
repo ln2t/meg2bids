@@ -44,6 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **EEG Support**: Automatic detection of simultaneous EEG recording in FIF files
+  - Extraction of EEG electrode coordinates from FIF channel metadata
+  - Automatic generation of `electrodes.tsv` files following BIDS specification
+  - Coordinates stored in MEG device frame (as per BIDS for simultaneous MEG/EEG)
+  - Non-blocking operation: silently skips if no EEG channels detected
+
 ### Planned
 - Support for other MEG manufacturers (CTF, BTI/4D, KIT/Yokogawa)
 - GUI interface for configuration
