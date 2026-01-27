@@ -32,9 +32,11 @@ import subprocess
 import shutil
 import fnmatch
 from collections import defaultdict
+import numpy as np
 import warnings
 
 import mne
+from mne.transforms import apply_trans
 from mne_bids import write_raw_bids, BIDSPath
 
 # Suppress mne and mne_bids verbose output
@@ -283,32 +285,67 @@ def find_matching_raw_file(derivative_filename: str, raw_files: List[Path], spli
     """
     Find the raw file that corresponds to a derivative file.
     
+    Handles both split naming patterns:
+    - file-1_mc.fif (split first, then processing)
+    - file_mc-1.fif (processing first, then split)
+    
     Args:
-        derivative_filename: Name of the derivative file (e.g., 'chessboard1_mc.fif')
+        derivative_filename: Name of the derivative file (e.g., 'chessboard1_mc.fif', 'file_mc-1.fif', 'file-1_mc.fif')
         raw_files: List of raw FIF file paths in the session
         split_file_groups: Dict mapping primary file → list of all split parts
     
     Returns:
         Tuple of (matching_raw_path, split_index) where:
-        - matching_raw_path: Path to the raw file
-        - split_index: Index if this is a split part (0=primary, 1=first split, etc), None if not split
+        - matching_raw_path: Path to the raw file (primary file if split)
+        - split_index: Index if derivative is a split part (0=primary, 1=first split, etc), None if not split
         Returns None if no match found
     """
-    deriv_info = extract_derivative_info(derivative_filename)
+    stem = Path(derivative_filename).stem
+    
+    # First, check if there's a split suffix at the end (e.g., file_mc-1 or file-1_mc)
+    split_match = re.match(r'^(.+?)-(\d+)$', stem)
+    split_num = None
+    base_stem_with_proc = stem
+    
+    if split_match:
+        # Has a split suffix: extract it
+        base_stem_with_proc = split_match.group(1)  # e.g., "file_mc" or "file"
+        split_num = int(split_match.group(2))        # e.g., 1, 2, 3
+    
+    # Now extract derivative info from the (possibly split-stripped) stem
+    # Reconstruct filename for derivative extraction
+    temp_filename = base_stem_with_proc + '.fif'
+    deriv_info = extract_derivative_info(temp_filename)
+    
     if not deriv_info:
+        # Not a derivative file
         return None
     
-    base_filename, _ = deriv_info
+    base_filename_stem, _ = deriv_info  # e.g., 'file.fif' → 'file'
+    base_filename_stem = Path(base_filename_stem).stem
     
-    for raw_path in raw_files:
-        if raw_path.name == base_filename:
-            # Check if this raw file is a split part
-            split_idx = None
-            for primary_file, parts in split_file_groups.items():
-                if raw_path in parts:
-                    split_idx = parts.index(raw_path)  # 0 = primary, 1 = split-1, etc
-                    break
-            return (raw_path, split_idx)
+    # Now we have the base stem and possibly a split number
+    if split_num is not None:
+        # Derivative is for a split part (e.g., 'file_mc-1.fif' or 'file-1_mc.fif')
+        primary_filename = f"{base_filename_stem}.fif"
+        
+        # Find the primary raw file
+        for raw_path in raw_files:
+            if raw_path.name == primary_filename:
+                # Verify this is actually a split file group
+                if raw_path in split_file_groups:
+                    return (raw_path, split_num)  # split_num matches the -N suffix
+                break
+    else:
+        # Derivative is for primary file (e.g., 'file_mc.fif')
+        primary_filename = f"{base_filename_stem}.fif"
+        for raw_path in raw_files:
+            if raw_path.name == primary_filename:
+                # Check if this raw file is part of a split group
+                if raw_path in split_file_groups:
+                    return (raw_path, 0)  # 0 = primary file
+                else:
+                    return (raw_path, None)  # Not a split file
     
     return None
 
@@ -794,21 +831,51 @@ def extract_eeg_information(raw: mne.io.BaseRaw) -> Optional[Dict[str, List[Any]
     
     for idx in eeg_indices:
         ch_info = raw.info['chs'][idx]
+        ch_name = ch_info['ch_name']
         
         # Channel name
-        eeg_data['name'].append(ch_info['ch_name'])
+        eeg_data['name'].append(ch_name)
         
-        # Channel location in device coordinates (in meters)
-        # loc[0:3] contains the electrode position
-        loc = ch_info['loc'][:3]
-        eeg_data['x'].append(loc[0])
-        eeg_data['y'].append(loc[1])
-        eeg_data['z'].append(loc[2])
+        # Primary: try channel loc in device coordinates (meters)
+        loc = np.array(ch_info['loc'][:3], dtype=float)
+        use_fallback = (not np.any(np.isfinite(loc))) or np.allclose(loc, 0.0)
+
+        if use_fallback:
+            # Fallback: try montage positions (typically in head coordinates)
+            montage = raw.get_montage()
+            if montage is not None:
+                try:
+                    positions = montage.get_positions()
+                    ch_pos = positions.get('ch_pos', {})
+                    if ch_name in ch_pos and ch_pos[ch_name] is not None:
+                        head_pos = np.array(ch_pos[ch_name], dtype=float)
+                        # Convert head → device if dev_head_t is available
+                        dev_head_t = raw.info.get('dev_head_t')
+                        if dev_head_t and 'trans' in dev_head_t and dev_head_t['trans'] is not None:
+                            try:
+                                loc = apply_trans(np.linalg.inv(dev_head_t['trans']), head_pos)
+                            except Exception:
+                                # If transform fails, keep head coordinates
+                                loc = head_pos
+                                logger.debug(f"    ⚠ Using head coords for {ch_name} (dev_head_t transform failed)")
+                        else:
+                            # No device-head transform available; use head coordinates
+                            loc = head_pos
+                            logger.debug(f"    ⚠ Using head coords for {ch_name} (missing dev_head_t)")
+                    else:
+                        logger.debug(f"    ⚠ No montage position for {ch_name}; coordinates remain zero")
+                except Exception as e:
+                    logger.debug(f"    ⚠ Montage fallback failed for {ch_name}: {e}")
+            else:
+                logger.debug(f"    ⚠ No montage found; coordinates for {ch_name} may be zero")
+
+        eeg_data['x'].append(float(loc[0]))
+        eeg_data['y'].append(float(loc[1]))
+        eeg_data['z'].append(float(loc[2]))
         
         # Electrode size (optional, in meters)
-        # Default to a reasonable size if not specified
         size = ch_info.get('size', 0.005)  # Default 5mm if not specified
-        eeg_data['size'].append(size)
+        eeg_data['size'].append(float(size))
     
     return eeg_data
 
@@ -938,11 +1005,7 @@ def write_derivative_raw(raw: mne.io.BaseRaw, subject: str, session: Optional[st
 
 
 def convert_raw_file(fif_path: Path, subject: str, session: Optional[str], task: str, run: Optional[int], config: BIDSConfig, pattern_rule: Dict[str, Any], bids_root: Path, split_parts: Optional[List[Path]] = None) -> None:
-    """Convert a single raw FIF file to BIDS.
-    
-    If the FIF file contains EEG channels recorded simultaneously with MEG,
-    also generates electrodes.tsv file with EEG electrode coordinates.
-    """
+    """Convert a single raw FIF file to BIDS."""
     datatype = config.get_datatype()
     allow_maxshield = config.get_option('allow_maxshield', True)
     
@@ -973,11 +1036,6 @@ def convert_raw_file(fif_path: Path, subject: str, session: Optional[str], task:
             logger.debug(f"    → Saved BIDS file with {len(split_parts)} split parts")
         else:
             logger.debug(f"    → Saved BIDS file: {bids_path.basename}")
-        
-        # Check for simultaneous EEG recording and generate electrodes.tsv if present
-        eeg_data = extract_eeg_information(raw)
-        if eeg_data is not None:
-            write_electrodes_tsv(eeg_data, subject, session, bids_root, datatype)
         
         conversion_stats.add_file(task, 'converted', fif_path.name)
         
@@ -1971,6 +2029,10 @@ See README_MEG2BIDS.md for complete documentation.
                 logger.info("─"*70)
                 logger.info("Starting conversion...\n")
                 
+                # Track EEG channels across all session files for electrodes.tsv
+                session_eeg_data = None
+                eeg_checked = False
+                
                 # Convert raw files (only primary files, split parts handled automatically)
                 for fif_path in primary_raw_files:
                     if fif_path not in file_mapping:
@@ -1980,7 +2042,22 @@ See README_MEG2BIDS.md for complete documentation.
                     task, run, pattern_rule = file_mapping[fif_path]
                     split_parts_for_file = split_file_groups.get(fif_path, None)
                     
+                    # Convert the raw file
                     convert_raw_file(fif_path, bids_subject.replace('sub-', ''), session_id, task, run, config, pattern_rule, bids_root, split_parts_for_file)
+                    
+                    # Check for EEG only once per session (from first file)
+                    if not eeg_checked:
+                        try:
+                            raw = mne.io.read_raw_fif(fif_path, preload=False, allow_maxshield=config.get_option('allow_maxshield', True), verbose=False)
+                            session_eeg_data = extract_eeg_information(raw)
+                            eeg_checked = True
+                        except Exception as e:
+                            logger.debug(f"  Could not check EEG in {fif_path.name}: {e}")
+                            eeg_checked = True
+                
+                # Write electrodes.tsv once per session if EEG was detected
+                if session_eeg_data is not None:
+                    write_electrodes_tsv(session_eeg_data, bids_subject.replace('sub-', ''), session_id, bids_root, config.get_datatype())
                 
                 # Convert derivative files (only if pipeline is configured)
                 if config.get_pipeline_name():

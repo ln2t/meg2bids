@@ -195,6 +195,100 @@ def test_electrodes_tsv_creation(tmp_path):
     assert electrodes_file_session.exists()
 
 
+def test_eeg_montage_fallback_head_to_device():
+    """Ensure montage positions are used when locs are zero and transformed to device coords if possible."""
+    import mne
+    import numpy as np
+    from meg2bids.meg2bids import extract_eeg_information
+    
+    # Create raw with EEG channels but zero locs
+    info = mne.create_info(
+        ch_names=['EEG004', 'EEG006'],
+        sfreq=250,
+        ch_types=['eeg', 'eeg']
+    )
+    
+    # Zero locs (default)
+    for ch in info['chs']:
+        ch['loc'][:3] = [0.0, 0.0, 0.0]
+    
+    raw = mne.io.RawArray(np.zeros((2, 1000)), info)
+    
+    # Build a simple montage with head coords
+    ch_pos = {
+        'EEG004': np.array([0.001, 0.0, 0.0]),
+        'EEG006': np.array([0.0, -0.001, 0.0]),
+    }
+    montage = mne.channels.make_dig_montage(ch_pos=ch_pos)
+    raw.set_montage(montage)
+    
+    # Create a simple dev->head transform (identity scaled)
+    # For test, set dev_head_t to identity so head==device
+    trans = np.eye(4)
+    raw.info['dev_head_t'] = {'from': mne.io.constants.FIFF.FIFFV_COORD_DEVICE,
+                              'to': mne.io.constants.FIFF.FIFFV_COORD_HEAD,
+                              'trans': trans}
+    
+    eeg_data = extract_eeg_information(raw)
+    assert eeg_data is not None
+    
+    # With identity transform, device coords == head coords
+    assert np.isclose(eeg_data['x'][0], 0.001)
+    assert np.isclose(eeg_data['y'][0], 0.0)
+    assert np.isclose(eeg_data['z'][0], 0.0)
+
+
+def test_split_file_derivative_matching():
+    """Test derivative matching for split files with both naming patterns."""
+    from meg2bids.meg2bids import find_matching_raw_file
+    from pathlib import Path
+    
+    # Mock raw files with split structure
+    raw_files = [
+        Path("/data/rest.fif"),
+        Path("/data/rest-1.fif"),
+        Path("/data/rest-2.fif"),
+    ]
+    
+    # Mock split file groups
+    split_file_groups = {
+        Path("/data/rest.fif"): [
+            Path("/data/rest.fif"),
+            Path("/data/rest-1.fif"),
+            Path("/data/rest-2.fif"),
+        ]
+    }
+    
+    # Test derivative matching for primary file
+    result = find_matching_raw_file("rest_mc.fif", raw_files, split_file_groups)
+    assert result is not None
+    assert result[0].name == "rest.fif"
+    assert result[1] == 0  # Primary file
+    
+    # Test pattern: file-1_mc.fif (split first, then processing)
+    result = find_matching_raw_file("rest-1_mc.fif", raw_files, split_file_groups)
+    assert result is not None
+    assert result[0].name == "rest.fif"  # Returns primary file
+    assert result[1] == 1  # Split index 1 (which is split-02 in BIDS)
+    
+    # Test pattern: file_mc-1.fif (processing first, then split)
+    result = find_matching_raw_file("rest_mc-1.fif", raw_files, split_file_groups)
+    assert result is not None
+    assert result[0].name == "rest.fif"  # Returns primary file
+    assert result[1] == 1  # Split index 1 (which is split-02 in BIDS)
+    
+    # Test split part -2 with both patterns
+    result = find_matching_raw_file("rest-2_mc.fif", raw_files, split_file_groups)
+    assert result is not None
+    assert result[0].name == "rest.fif"
+    assert result[1] == 2  # Split index 2 (which is split-03 in BIDS)
+    
+    result = find_matching_raw_file("rest_mc-2.fif", raw_files, split_file_groups)
+    assert result is not None
+    assert result[0].name == "rest.fif"
+    assert result[1] == 2  # Split index 2 (which is split-03 in BIDS)
+
+
 def test_pattern_matching():
     """Test file pattern matching."""
     from meg2bids.meg2bids import match_file_pattern
