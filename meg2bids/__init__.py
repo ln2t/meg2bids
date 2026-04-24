@@ -1,6 +1,6 @@
 # meg2bids Package Information
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "Quentin Vandermiers"
 __email__ = "quentin.vandermiers@ulb.be"
 __license__ = "GPL-3.0"

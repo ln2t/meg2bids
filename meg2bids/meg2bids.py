@@ -43,7 +43,11 @@ from mne_bids import write_raw_bids, BIDSPath
 mne.set_log_level('ERROR')
 logging.getLogger('mne_bids').setLevel(logging.ERROR)
 logging.getLogger('mne').setLevel(logging.ERROR)
-warnings.filterwarnings('ignore')
+warnings.filterwarnings('ignore', category=DeprecationWarning, module='mne')
+warnings.filterwarnings('ignore', message='.*headshape.*', category=UserWarning)
+warnings.filterwarnings('ignore', message='.*does not conform to MNE naming conventions.*')
+warnings.filterwarnings('ignore', message='.*raw Internal Active Shielding data.*')
+warnings.filterwarnings('ignore', message='.*No events found or provided.*')
 
 
 def setup_logging() -> logging.Logger:
@@ -65,7 +69,7 @@ def setup_logging() -> logging.Logger:
     return logger
 
 
-logger = None
+logger: logging.Logger = logging.getLogger("MEG2BIDS")
 
 
 class ValidationError(Exception):
@@ -79,6 +83,7 @@ class ConversionStats:
         self.total_files = 0
         self.converted = 0
         self.skipped = 0
+        self.excluded = 0
         self.failed = 0
         self.task_counts = defaultdict(int)
         self.failed_files = []
@@ -93,6 +98,8 @@ class ConversionStats:
             self.task_counts[task] += 1
         elif status == 'skipped':
             self.skipped += 1
+        elif status == 'excluded':
+            self.excluded += 1
         elif status == 'failed':
             self.failed += 1
             if filename:
@@ -112,6 +119,8 @@ class ConversionStats:
         lines.append(f"  Total files:    {self.total_files}")
         lines.append(f"  ✓ Converted:    {self.converted}")
         lines.append(f"  ⊘ Skipped:      {self.skipped}")
+        if self.excluded > 0:
+            lines.append(f"  ⊗ Excluded:     {self.excluded}")
         if self.failed > 0:
             lines.append(f"  ✗ Failed:       {self.failed}")
         
@@ -132,7 +141,7 @@ class ConversionStats:
         return "\n".join(lines)
 
 
-conversion_stats = None
+conversion_stats: Optional['ConversionStats'] = None
 
 
 class BIDSConfig:
@@ -159,7 +168,10 @@ class BIDSConfig:
         for key in required:
             if key not in self.config:
                 raise ValueError(f"Missing required config section: {key}")
-    
+        if 'exclude_patterns' not in self.config:
+            self.config['exclude_patterns'] = []
+        elif not isinstance(self.config['exclude_patterns'], list):
+            raise ValueError("'exclude_patterns' must be a list of wildcard patterns")    
     def get_datatype(self) -> str:
         return self.config.get('dataset', {}).get('datatype', 'meg')
     
@@ -219,27 +231,43 @@ class BIDSConfig:
         """Get maxfilter version from derivatives config."""
         return self.config.get('derivatives', {}).get('maxfilter_version')
 
+    def get_exclude_patterns(self) -> List[str]:
+        """Return list of file exclusion wildcard patterns."""
+        return self.config.get('exclude_patterns', [])
 
-def extract_derivative_info(filename: str) -> Optional[Tuple[str, str]]:
-    """
-    Detect and extract MaxFilter processing information from filename.
-    
-    Strips recognized suffixes from the end of the filename (in order) and builds
-    the base filename. Handles multiple suffixes (e.g., chessboard2_mc_ave.fif).
-    
-    Recognized suffixes (processed in order):
-      _tsss, _sss → "tsss", "sss"
-      _mc → "mc"
-      _quat, _trans → "quat", "trans"
-      _ave, _av → "ave"
-    
+
+def _extract_base_name_and_suffix(filename: str, with_proc: bool = False) -> Tuple[str, Optional[str]]:
+    """Extract base name and optional proc suffix from a FIF filename.
+
+    Used by split detection and derivative detection to group files by their
+    base name and processing label.
+
+    Args:
+        filename: FIF filename
+        with_proc: If True, also extract proc label (e.g., 'tsss-mc').
+                   If False, strip split suffixes only.
+
     Returns:
-      (base_filename, proc_label) if derivative detected, None if raw file
-      Example: chessboard2_mc_ave.fif → ("chessboard2.fif", "mc-ave")
+        (base_name, proc_label) where proc_label is None if with_proc=False
+        or no proc suffix found.
     """
     stem = Path(filename).stem
-    
-    # List of recognized MaxFilter suffixes in order of priority for matching
+
+    # FIRST: Remove trailing split suffix if present (e.g., _sss-2)
+    # This is for Pattern 2: base_sss-2.fif
+    split_after_proc = re.match(r'^(.+)-\d+$', stem)
+    if split_after_proc:
+        stem = split_after_proc.group(1)
+
+    if not with_proc:
+        # Also remove leading split suffix if present (e.g., -1_sss becomes just sss part)
+        # This is for Pattern 1: base-1_sss.fif
+        split_before_proc = re.match(r'^(.+?)-\d+(.*)$', stem)
+        if split_before_proc:
+            stem = split_before_proc.group(1) + split_before_proc.group(2)
+        return (stem, None)
+
+    # Extract proc label
     derivative_suffixes = [
         ('_tsss', 'tsss'),
         ('_sss', 'sss'),
@@ -247,38 +275,258 @@ def extract_derivative_info(filename: str) -> Optional[Tuple[str, str]]:
         ('_quat', 'quat'),
         ('_trans', 'trans'),
         ('_ave', 'ave'),
-        ('_av', 'ave'),  # _av maps to same label as _ave
+        ('_av', 'ave'),
     ]
-    
-    # Keep stripping suffixes from the end until none match
+
     current_stem = stem
     found_suffixes = []
-    
+
     while True:
         found_match = False
         for suffix, label in derivative_suffixes:
             if current_stem.lower().endswith(suffix):
-                found_suffixes.insert(0, label)  # Insert at beginning to preserve order
+                found_suffixes.insert(0, label)
                 current_stem = current_stem[:-len(suffix)]
                 found_match = True
                 break
-        
         if not found_match:
             break
-    
-    # If we found at least one suffix, return the base filename and combined label
+
+    # FINALLY: Remove any remaining leading split suffix (e.g., -1 or -2)
+    # This is for Pattern 1: base-1_sss.fif where base_name is extracted after removing _sss
+    split_before_proc = re.match(r'^(.+?)-\d+$', current_stem)
+    if split_before_proc:
+        current_stem = split_before_proc.group(1)
+
     if found_suffixes:
-        # Combine multiple proc labels with hyphens, avoiding duplicates
         unique_labels = []
         for label in found_suffixes:
             if label not in unique_labels:
                 unique_labels.append(label)
         proc_label = '-'.join(unique_labels)
-        
-        base_filename = current_stem + '.fif'
-        return (base_filename, proc_label)
-    
+        return (current_stem, proc_label)
+
+    return (stem, None)
+
+
+def should_exclude_file(filename: str, exclude_patterns: List[str]) -> Optional[str]:
+    """Check if a file should be excluded based on configured patterns.
+
+    Performs case-insensitive wildcard matching against exclude patterns.
+
+    Args:
+        filename: FIF filename to check
+        exclude_patterns: List of wildcard patterns (e.g., '*test*', '*demo*')
+
+    Returns:
+        Matched pattern if file should be excluded, None otherwise
+    """
+    if not exclude_patterns:
+        return None
+
+    filename_lower = filename.lower()
+    for pattern in exclude_patterns:
+        if fnmatch.fnmatch(filename_lower, pattern.lower()):
+            return pattern
+
     return None
+
+
+def get_fif_header_info(file_path: Path) -> Optional[Dict[str, Any]]:
+    """Extract metadata from FIF file header without loading full data.
+
+    Reads only the FIF header to extract recording fingerprint info.
+
+    Args:
+        file_path: Path to FIF file
+
+    Returns:
+        Dict with 'file_id', 'meas_date', 'first_samps', 'is_primary', 'n_parts'
+        or None if read failed.
+    """
+    try:
+        raw = mne.io.read_raw_fif(file_path, preload=False, allow_maxshield=True, verbose=False)
+
+        file_id = raw.info.get('file_id', {})
+        meas_date = raw.info.get('meas_date')
+
+        meas_date_str = None
+        if meas_date:
+            if isinstance(meas_date, datetime):
+                meas_date_str = meas_date.isoformat()
+            elif isinstance(meas_date, date):
+                meas_date_str = meas_date.isoformat()
+
+        first_samps = getattr(raw, '_first_samps', None)
+        last_samps = getattr(raw, '_last_samps', None)
+
+        return {
+            'file_id': file_id,
+            'meas_date': meas_date_str,
+            'n_samples': raw.n_times,
+            'sfreq': raw.info.get('sfreq'),
+            'n_channels': len(raw.ch_names),
+            'duration_sec': raw.times[-1] if len(raw.times) > 0 else 0,
+            'first_samps': first_samps,
+            'last_samps': last_samps,
+            'is_primary': first_samps is not None and len(first_samps) > 1,
+            'n_parts': len(first_samps) if first_samps is not None else 1,
+        }
+    except Exception as e:
+        logger.warning(f"Failed to read FIF header from {file_path.name}: {e}")
+        return None
+
+
+def inspect_fif_header(fif_path: Path, verbose: bool = True) -> Optional[Dict[str, Any]]:
+    """Inspect and display detailed FIF header information for debugging.
+
+    Args:
+        fif_path: Path to FIF file
+        verbose: If True, log detailed information
+
+    Returns:
+        Dict with detailed header information, or None if read failed
+    """
+    try:
+        raw = mne.io.read_raw_fif(fif_path, preload=False, allow_maxshield=True, verbose=False)
+
+        file_id = raw.info.get('file_id', {})
+        meas_date = raw.info.get('meas_date')
+
+        result = {
+            'filename': fif_path.name,
+            'meas_date': str(meas_date) if meas_date else None,
+            'duration_sec': raw.times[-1] if len(raw.times) > 0 else 0,
+            'n_samples': raw.n_times,
+            'n_channels': len(raw.ch_names),
+            'sfreq': raw.info.get('sfreq'),
+            'file_id': file_id,
+        }
+
+        if verbose:
+            logger.info(f"FIF Header: {fif_path.name}")
+            logger.info(f"  Meas date: {result['meas_date']}")
+            logger.info(f"  Duration: {result['duration_sec']:.1f}s")
+            logger.info(f"  Samples: {result['n_samples']:,}")
+            logger.info(f"  Channels: {result['n_channels']}")
+            logger.info(f"  Sfreq: {result['sfreq']} Hz")
+
+            if file_id:
+                logger.info(f"  File ID:")
+                for key, value in file_id.items():
+                    logger.info(f"    {key}: {value}")
+
+            if hasattr(raw, '_first_samps') and hasattr(raw, '_last_samps'):
+                logger.info(f"  Split info (internal):")
+                logger.info(f"    First samples: {raw._first_samps}")
+                logger.info(f"    Last samples: {raw._last_samps}")
+
+        return result
+    except Exception as e:
+        if verbose:
+            logger.warning(f"Failed to inspect FIF header from {fif_path.name}: {e}")
+        return None
+
+
+def prompt_user_for_duplicate(files: List[Path]) -> Path:
+    """Prompt user to choose between duplicate files.
+
+    Only prompts if stdin is a TTY (interactive environment).
+    Falls back silently to first file if not interactive.
+
+    Args:
+        files: List of duplicate file paths (should have 2+ files)
+
+    Returns:
+        The file chosen by the user, or first file if non-interactive
+    """
+    if not sys.stdin.isatty():
+        logger.debug(f"Non-interactive environment: silently choosing {files[0].name}")
+        return files[0]
+
+    print(f"\n⚠  Duplicate files with same preference level found:")
+    for idx, fpath in enumerate(files, 1):
+        print(f"  {idx}. {fpath.name}")
+
+    while True:
+        try:
+            response = input(f"\nWhich file to keep? Enter 1-{len(files)}: ").strip()
+            choice = int(response)
+            if 1 <= choice <= len(files):
+                selected = files[choice - 1]
+                print(f"✓ Selected: {selected.name}\n")
+                return selected
+            else:
+                print(f"Invalid choice. Please enter 1-{len(files)}.")
+        except ValueError:
+            print(f"Invalid input. Please enter a number 1-{len(files)}.")
+
+
+def has_fif_files_in_folder(folder: Path) -> bool:
+    """Check if FIF files exist directly in a folder (non-recursive).
+
+    Used to detect legacy MEG data without session subdirectories.
+
+    Args:
+        folder: Path to folder to check
+
+    Returns:
+        True if one or more .fif files found directly in folder
+    """
+    if not folder.exists():
+        return False
+    return len(list(folder.glob("*.fif"))) > 0
+
+
+def extract_measurement_date_from_fif(fif_file: Path) -> Optional[str]:
+    """Extract measurement date from a FIF file and convert to YYMMDD format.
+
+    Used as fallback for calibration file matching when session folder
+    doesn't contain a date.
+
+    Args:
+        fif_file: Path to raw FIF file
+
+    Returns:
+        Date string in YYMMDD format, or None if extraction failed
+    """
+    if not fif_file.exists():
+        return None
+
+    try:
+        raw = mne.io.read_raw_fif(fif_file, preload=False, allow_maxshield=True, verbose=False)
+        meas_date = raw.info.get('meas_date')
+
+        if isinstance(meas_date, datetime):
+            return meas_date.strftime('%y%m%d')
+        elif isinstance(meas_date, date):
+            return meas_date.strftime('%y%m%d')
+
+        return None
+    except Exception as e:
+        logger.debug(f"Could not extract measurement date from {fif_file.name}: {e}")
+        return None
+
+
+def extract_derivative_info(filename: str) -> Optional[Tuple[str, str]]:
+    """
+    Detect and extract MaxFilter processing information from filename.
+
+    Strips recognized suffixes and builds the base filename. Handles multiple
+    suffixes (e.g., chessboard2_mc_ave.fif -> chessboard2.fif, "mc-ave").
+    Also handles split file suffixes (e.g., file_tsss_mc-1.fif, file-1_tsss_mc.fif).
+
+    Returns:
+      (base_filename, proc_label) if derivative detected, None if raw file
+      Example: chessboard2_mc_ave.fif -> ("chessboard2.fif", "mc-ave")
+    """
+    base_name, proc_label = _extract_base_name_and_suffix(filename, with_proc=True)
+
+    if proc_label is None:
+        return None
+
+    base_filename = base_name + '.fif'
+    return (base_filename, proc_label)
 
 
 def find_matching_raw_file(derivative_filename: str, raw_files: List[Path], split_file_groups: Dict[Path, List[Path]]) -> Optional[Tuple[Path, Optional[int]]]:
@@ -475,12 +723,12 @@ def validate_all_files(fif_files: List[Path], file_patterns: List[Dict[str, Any]
     return file_pattern_map
 
 
-def extract_run_from_filename(filename: str, extraction_method: str = "last_digits") -> Optional[int]:
+def extract_run_from_filename(filename: str, extraction_method: str = "last_digits", meg_id: Optional[str] = None) -> Optional[int]:
     """
     Extract run number from filename.
     
     NOTE: Excludes split file patterns (e.g., -1.fif, -2.fif) which indicate
-    file splits, not run numbers.
+    file splits, not run numbers. Rejects if the extracted number matches meg_id.
     """
     if extraction_method == "none":
         return None
@@ -495,10 +743,26 @@ def extract_run_from_filename(filename: str, extraction_method: str = "last_digi
         stem = split_match.group(1)  # Use base name without split number
     
     matches = re.findall(r'\d+', stem)
-    return int(matches[-1]) if matches else None
+    if not matches:
+        return None
+    
+    if extraction_method == "first_digits":
+        candidate = int(matches[0])
+    else:  # "last_digits" or default
+        candidate = int(matches[-1])
+    
+    # Reject if it matches the MEG ID (not a run number)
+    if meg_id is not None:
+        try:
+            if candidate == int(meg_id):
+                return None
+        except (ValueError, TypeError):
+            pass
+    
+    return candidate
 
 
-def group_files_by_task(file_pattern_map: Dict[Path, Dict[str, Any]]) -> Dict[str, List[Tuple[Path, Dict[str, Any], Optional[int]]]]:
+def group_files_by_task(file_pattern_map: Dict[Path, Dict[str, Any]], meg_id: Optional[str] = None) -> Dict[str, List[Tuple[Path, Dict[str, Any], Optional[int]]]]:
     """Group files by task and extract run numbers."""
     task_files = defaultdict(list)
     
@@ -506,7 +770,8 @@ def group_files_by_task(file_pattern_map: Dict[Path, Dict[str, Any]]) -> Dict[st
         task = pattern_rule.get('task', 'unknown')
         run_from_filename = extract_run_from_filename(
             fif_path.name,
-            pattern_rule.get('run_extraction', 'last_digits')
+            pattern_rule.get('run_extraction', 'last_digits'),
+            meg_id=meg_id
         )
         task_files[task].append((fif_path, pattern_rule, run_from_filename))
     
@@ -563,7 +828,7 @@ def find_fine_calibration_file(meg_maxfilter_root: Path, session_date: Optional[
     
     if calibration_system == 'vectorview':
         # VectorView: single file, no date matching needed
-        vectorview_file = sss_dir / 'sss_cal_vectorview.dat'
+        vectorview_file = sss_dir / 'sss_cal_erasme_enm.dat'
         if vectorview_file.exists():
             logger.info(f"  ✓ Fine-calibration: {vectorview_file.name} (VectorView)")
             return vectorview_file
@@ -626,7 +891,7 @@ def find_fine_calibration_file(meg_maxfilter_root: Path, session_date: Optional[
                 selected_file = f
                 selected_date = cal_date
         
-        if selected_file:
+        if selected_file and selected_date:
             logger.info(f"  ✓ Fine-calibration: {selected_file.name} (cal date: {selected_date.strftime('%Y-%m-%d')}, session date: {session_dt.strftime('%Y-%m-%d')})")
             return selected_file
         else:
@@ -634,17 +899,19 @@ def find_fine_calibration_file(meg_maxfilter_root: Path, session_date: Optional[
             return None
 
 
-def detect_calibration_files(source_dir: Path, session_folder: Optional[str] = None, meg_maxfilter_root: Optional[Path] = None, calibration_system: str = 'triux') -> Dict[str, Optional[Path]]:
+def detect_calibration_files(source_dir: Path, session_folder: Optional[str] = None, meg_maxfilter_root: Optional[Path] = None, calibration_system: str = 'triux', raw_fif_files: Optional[List[Path]] = None) -> Dict[str, Optional[Path]]:
     """Auto-detect Neuromag/Elekta/MEGIN calibration files.
     
     If meg_maxfilter_root is provided, looks for calibration files in:
-      - Crosstalk: MEG/maxfilter/ctc/ct_sparse_triux2.fif (triux) or ct_sparse_vectorview.fif (vectorview)
-      - Fine-cal: MEG/maxfilter/sss/sss_cal_XXXX_*.dat (date-matched to session date for triux) or sss_cal_vectorview.dat (vectorview)
+      - Crosstalk: MEG/maxfilter/ctc/ct_sparse_triux2.fif (triux) or ct_sparse_erasme_enm.fif (vectorview)
+      - Fine-cal: MEG/maxfilter/sss/sss_cal_XXXX_*.dat (date-matched to session date for triux) or sss_cal_erasme_enm.dat (vectorview)
     
     Session date is extracted from session_folder name (YYMMDD format).
+    If folder name has no date and raw_fif_files is provided, falls back to
+    extracting measurement date from the first FIF file.
     Falls back to searching the session directory if meg_maxfilter_root not found.
     """
-    calibration_files = {'crosstalk': None, 'calibration': None}
+    calibration_files: Dict[str, Optional[Path]] = {'crosstalk': None, 'calibration': None}
     
     # If meg_maxfilter_root provided, use it first
     if meg_maxfilter_root and meg_maxfilter_root.exists():
@@ -652,7 +919,7 @@ def detect_calibration_files(source_dir: Path, session_folder: Optional[str] = N
         
         if calibration_system == 'vectorview':
             # VectorView crosstalk
-            crosstalk_file = ctc_dir / 'ct_sparse_vectorview.fif'
+            crosstalk_file = ctc_dir / 'ct_sparse_erasme_enm.fif'
             if crosstalk_file.exists():
                 calibration_files['crosstalk'] = crosstalk_file
                 logger.debug(f"  Found cross-talk file (VectorView): {crosstalk_file.name}")
@@ -675,6 +942,12 @@ def detect_calibration_files(source_dir: Path, session_folder: Optional[str] = N
             match = re.search(r'(\d{6})', session_folder)
             if match:
                 session_date = match.group(1)
+        
+        # Fallback: extract measurement date from FIF file if folder name has no date
+        if not session_date and raw_fif_files and len(raw_fif_files) > 0:
+            session_date = extract_measurement_date_from_fif(raw_fif_files[0])
+            if session_date:
+                logger.debug(f"  Extracted session date from FIF header: {session_date}")
         
         # Find calibration file based on session date
         calibration_files['calibration'] = find_fine_calibration_file(meg_maxfilter_root, session_date, calibration_system)
@@ -748,13 +1021,8 @@ def detect_split_files(fif_files: List[Path]) -> Dict[Path, List[Path]]:
     for fif_path in sorted(fif_files):
         if fif_path in processed:
             continue
-        
-        stem = fif_path.stem
-        match = re.match(r'^(.+?)(?:-\d+)?$', stem)
-        if not match:
-            continue
-        
-        base_name = match.group(1)
+
+        base_name, _ = _extract_base_name_and_suffix(fif_path.name, with_proc=False)
         parent_dir = fif_path.parent
         base_file = parent_dir / f"{base_name}.fif"
         
@@ -782,6 +1050,297 @@ def detect_split_files(fif_files: List[Path]) -> Dict[Path, List[Path]]:
             logger.debug(f"  Detected split file: {base_name} ({len(parts)} parts)")
     
     return split_groups
+
+
+def detect_derivative_split_files(deriv_files: List[Path]) -> Tuple[Dict[Path, List[Path]], set]:
+    """Detect and group multi-part derivative FIFF files.
+
+    Groups derivatives by (base_name, proc_label) and detects split patterns.
+
+    Handles both patterns:
+    - NAP-1_tsss_mc.fif, NAP-2_tsss_mc.fif (split before proc)
+    - NAP_tsss_mc-1.fif, NAP_tsss_mc-2.fif (split after proc)
+
+    Args:
+        deriv_files: List of derivative FIF file paths
+
+    Returns:
+        (split_groups, processed_set) where split_groups maps primary file to
+        list of all parts in order, and processed_set contains all files in
+        any split group.
+    """
+    split_groups: Dict[Path, List[Path]] = {}
+    processed: set = set()
+    deriv_files_set = set(deriv_files)
+
+    # Group derivatives by (base_name, proc_label)
+    deriv_groups: Dict[Tuple[str, str], List[Path]] = defaultdict(list)
+    for deriv_file in deriv_files:
+        base_name, proc_label = _extract_base_name_and_suffix(deriv_file.name, with_proc=True)
+        if proc_label is None:
+            continue
+        deriv_groups[(base_name, proc_label)].append(deriv_file)
+
+    # For each group, detect splits
+    for (base_name, proc_label), files in deriv_groups.items():
+        if len(files) <= 1:
+            continue
+
+        proc_suffix = proc_label.replace('-', '_')
+        parent_dir = files[0].parent
+        parts: List[Path] = []
+
+        # Try pattern 1: base_proc.fif, base-1_proc.fif, base-2_proc.fif (split BEFORE proc)
+        base_file = parent_dir / f"{base_name}_{proc_suffix}.fif"
+        pattern1_parts: List[Path] = []
+        if base_file in deriv_files_set:
+            pattern1_parts.append(base_file)
+
+        # Look for split parts (-1, -2, etc.)
+        idx = 1
+        while True:
+            next_part = parent_dir / f"{base_name}-{idx}_{proc_suffix}.fif"
+            if next_part in deriv_files_set:
+                pattern1_parts.append(next_part)
+                idx += 1
+            else:
+                break
+
+        if len(pattern1_parts) > 1:
+            parts = pattern1_parts
+
+        # If pattern 1 didn't find splits, try pattern 2: base_proc-1.fif, base_proc-2.fif
+        if not parts:
+            base_file_p2 = parent_dir / f"{base_name}_{proc_suffix}-1.fif"
+            if base_file_p2 in deriv_files_set:
+                pattern2_parts: List[Path] = []
+                # Check if there's also a base file without split suffix
+                base_without_split = parent_dir / f"{base_name}_{proc_suffix}.fif"
+                if base_without_split in deriv_files_set:
+                    pattern2_parts.append(base_without_split)
+
+                idx = 1
+                while True:
+                    next_part = parent_dir / f"{base_name}_{proc_suffix}-{idx}.fif"
+                    if next_part in deriv_files_set:
+                        pattern2_parts.append(next_part)
+                        idx += 1
+                    else:
+                        break
+
+                if len(pattern2_parts) > 1:
+                    parts = pattern2_parts
+
+        # Create split group if we found parts
+        if len(parts) > 1:
+            split_groups[parts[0]] = parts
+            # Mark ALL files in this (base_name, proc_label) group as processed
+            processed.update(files)
+
+    return split_groups, processed
+
+
+def identify_primary_files(fif_files: List[Path], interactive: bool = False) -> Tuple[List[Path], int]:
+    """Identify and filter FIF files by separating duplicates.
+
+    Uses FIF header fingerprints to deduplicate files that represent the same
+    recording (e.g., renamed copies, redundant split parts).
+
+    Algorithm:
+    - PHASE 1: Classify by split structure (PRIMARY: len(first_samps)>1, OTHER: ==1)
+    - PHASE 2: Deduplicate PRIMARYs by fingerprint (meas_date, first_samps[0])
+    - PHASE 3: Link OTHER files to kept PRIMARYs; remainder are STANDALONEs
+    - PHASE 4: Deduplicate STANDALONEs by fingerprint
+
+    Args:
+        fif_files: List of FIF file paths
+        interactive: If True, prompt user when duplicates have same preference level
+
+    Returns:
+        (files_to_keep, split_group_count) where split_group_count is the number
+        of multi-part recordings detected.
+    """
+    if not fif_files:
+        return [], 0
+
+    logger.info("Identifying duplicate files...")
+
+    # Read headers for all files
+    file_headers: Dict[Path, Optional[Dict]] = {}
+    for fif_file in fif_files:
+        header_info = get_fif_header_info(fif_file)
+        file_headers[fif_file] = header_info  # may be None
+
+    # Helper: filename preference score (underscore=0, dash=1, none=2)
+    def get_preference_level(file_path: Path) -> int:
+        stem = file_path.stem
+        if re.search(r'^.+_\d+$', stem):
+            return 0  # underscore suffix: base_N
+        if re.search(r'^.+?-\d+$', stem):
+            return 1  # dash suffix: base-N
+        return 2     # no numeric suffix
+
+    # Helper: create fingerprint
+    def get_fingerprint(file_path: Path) -> tuple:
+        hdr = file_headers.get(file_path)
+        if not hdr:
+            return ('unknown', file_path.name)
+        first_samps = hdr['first_samps']
+        first_samp_tuple = tuple(int(s) for s in first_samps) if first_samps is not None else ()
+        meas_date = hdr['meas_date'] or 'unknown'
+        return (meas_date, first_samp_tuple)
+
+    # Helper: select best from duplicate group
+    def process_duplicate_group(files_in_group: List[Path], interactive: bool = False) -> Path:
+        if len(files_in_group) == 1:
+            return files_in_group[0]
+        files_sorted = sorted(files_in_group, key=lambda f: (get_preference_level(f), f.name))
+        if len(files_sorted) >= 2:
+            level_1 = get_preference_level(files_sorted[0])
+            level_2 = get_preference_level(files_sorted[1])
+            if level_1 == level_2 and interactive:
+                canonical = prompt_user_for_duplicate(files_sorted)
+                logger.info(f"  → (user selected) {canonical.name} from {len(files_sorted)} duplicate(s)")
+                return canonical
+        canonical = files_sorted[0]
+        if len(files_sorted) > 1:
+            kept = files_sorted[0].name
+            for excluded_file in files_sorted[1:]:
+                logger.info(f"  → {kept} <-> {excluded_file.name}")
+        return canonical
+
+    # Helper: parse filename to get (base, number, separator)
+    def parse_filename_with_number(filename: str) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+        stem = filename[:-4] if filename.endswith('.fif') else filename
+        match = re.search(r'^(.+)_(\d+)$', stem)
+        if match:
+            return (match.group(1), int(match.group(2)), '_')
+        match = re.search(r'^(.+?)-([\d]+)$', stem)
+        if match:
+            return (match.group(1), int(match.group(2)), '-')
+        return (None, None, None)
+
+    # ========== PHASE 1: Classify ==========
+    primary_files: List[Path] = []
+    other_files: List[Path] = []
+
+    for fif_file in sorted(fif_files):
+        hdr = file_headers.get(fif_file)
+        if hdr and hdr['first_samps'] is not None and len(hdr['first_samps']) > 1:
+            primary_files.append(fif_file)
+        else:
+            other_files.append(fif_file)
+
+    # ========== PHASE 2: Deduplicate PRIMARYs ==========
+    primary_by_fp: Dict[Tuple, List[Path]] = defaultdict(list)
+    for fif_file in primary_files:
+        hdr = file_headers.get(fif_file)
+        if hdr and hdr['first_samps'] is not None and len(hdr['first_samps']) > 0 and hdr['meas_date']:
+            first_samp = int(hdr['first_samps'][0])
+            fp: tuple = (hdr['meas_date'], first_samp)
+        else:
+            fp = ('unknown', fif_file.name)
+        primary_by_fp[fp].append(fif_file)
+
+    kept_primary_files: set = set()
+    excluded_primary_files: set = set()
+
+    for fp, files_in_group in primary_by_fp.items():
+        canonical = process_duplicate_group(files_in_group, interactive=interactive)
+        kept_primary_files.add(canonical)
+        for fif_file in files_in_group:
+            if fif_file != canonical:
+                excluded_primary_files.add(fif_file)
+
+    # ========== PHASE 3: Link SECONDARY files to KEPT PRIMARYs ==========
+    kept_primary_map: Dict[str, str] = {}
+    for kept_primary in kept_primary_files:
+        hdr = file_headers.get(kept_primary)
+        if hdr and hdr['meas_date']:
+            stem = kept_primary.name[:-4]
+            kept_primary_map[stem] = hdr['meas_date']
+
+    secondary_files: List[Path] = []
+    standalone_files: List[Path] = []
+    kept_secondaries: set = set()
+
+    # First pass: identify SECONDARY files linked to kept PRIMARY
+    for fif_file in other_files:
+        hdr = file_headers.get(fif_file)
+        is_secondary_candidate = (
+            hdr and hdr['meas_date'] and
+            hdr['first_samps'] is not None and
+            len(hdr['first_samps']) == 1
+        )
+        if not is_secondary_candidate:
+            standalone_files.append(fif_file)
+            continue
+
+        matched_to_kept = False
+        base_file, num_file, sep_file = parse_filename_with_number(fif_file.name)
+        if base_file and sep_file == '-':
+            for primary_stem, primary_meas_date in kept_primary_map.items():
+                primary_base, primary_num, primary_sep = parse_filename_with_number(primary_stem + ".fif")
+                if (base_file == primary_base and
+                        primary_sep == '_' and
+                        hdr and hdr['meas_date'] == primary_meas_date):
+                    secondary_files.append(fif_file)
+                    logger.debug(f"  SECONDARY (kept): {fif_file.name} -> linked to {primary_stem}.fif")
+                    matched_to_kept = True
+                    break
+
+        if not matched_to_kept:
+            standalone_files.append(fif_file)
+
+    # Second pass: among standalones, find duplicates of kept SECONDARY files
+    for fif_file in list(standalone_files):
+        hdr = file_headers.get(fif_file)
+        is_secondary_candidate = (
+            hdr and hdr['meas_date'] and
+            hdr['first_samps'] is not None and
+            len(hdr['first_samps']) == 1
+        )
+        if not is_secondary_candidate or not hdr:
+            continue
+
+        first_samp = int(hdr['first_samps'][0])
+        meas_date = hdr['meas_date']
+        candidate_fp = (first_samp, meas_date)
+
+        is_duplicate = False
+        for kept_sec in secondary_files:
+            kept_hdr = file_headers.get(kept_sec)
+            if kept_hdr and kept_hdr['first_samps'] is not None and len(kept_hdr['first_samps']) == 1:
+                kept_fp = (int(kept_hdr['first_samps'][0]), kept_hdr['meas_date'])
+                if candidate_fp == kept_fp:
+                    is_duplicate = True
+                    break
+
+        if is_duplicate:
+            standalone_files.remove(fif_file)
+            logger.debug(f"  SECONDARY (excluded - duplicate): {fif_file.name}")
+
+    # ========== PHASE 4: Deduplicate STANDALONEs ==========
+    standalone_by_fp: Dict[tuple, List[Path]] = defaultdict(list)
+    for fif_file in standalone_files:
+        fp = get_fingerprint(fif_file)
+        standalone_by_fp[fp].append(fif_file)
+
+    kept_standalone_files: List[Path] = []
+    for fp, files_in_group in standalone_by_fp.items():
+        canonical = process_duplicate_group(files_in_group, interactive=interactive)
+        kept_standalone_files.append(canonical)
+
+    # ========== Combine results ==========
+    files_to_keep = list(kept_primary_files) + kept_standalone_files
+
+    split_group_count = sum(
+        1 for kp in kept_primary_files
+        if (file_headers.get(kp) or {}).get('first_samps') is not None
+        and len((file_headers.get(kp) or {}).get('first_samps', [])) > 1
+    )
+
+    return files_to_keep, split_group_count
 
 
 def ensure_derivatives_description(deriv_root: Path, pipeline_name: str, pipeline_version: Optional[str]) -> None:
@@ -816,7 +1375,7 @@ def extract_eeg_information(raw: mne.io.BaseRaw) -> Optional[Dict[str, List[Any]
     Returns None if no EEG channels found.
     """
     # Get EEG channel indices
-    eeg_indices = mne.pick_types(raw.info, eeg=True, exclude=[])
+    eeg_indices = mne.pick_types(raw.info, eeg=True, exclude=[])  # type: ignore[arg-type]
     
     if len(eeg_indices) == 0:
         return None
@@ -846,7 +1405,7 @@ def extract_eeg_information(raw: mne.io.BaseRaw) -> Optional[Dict[str, List[Any]
             if montage is not None:
                 try:
                     positions = montage.get_positions()
-                    ch_pos = positions.get('ch_pos', {})
+                    ch_pos = positions.get('ch_pos') or {}
                     if ch_name in ch_pos and ch_pos[ch_name] is not None:
                         head_pos = np.array(ch_pos[ch_name], dtype=float)
                         # Convert head → device if dev_head_t is available
@@ -1018,6 +1577,10 @@ def convert_raw_file(fif_path: Path, subject: str, session: Optional[str], task:
         # when you pass the first file (the one without -1, -2, etc.)
         # MNE automatically detects and reads split files like file.fif, file-1.fif, file-2.fif
         raw = mne.io.read_raw_fif(fif_path, preload=False, allow_maxshield=allow_maxshield, verbose=False)
+        # Check actual split structure from header
+        actual_first_samps = getattr(raw, '_first_samps', None)
+        if actual_first_samps is not None and len(actual_first_samps) > 1 and not split_str:
+            logger.debug(f"    ({len(actual_first_samps)} parts detected from header)")
         normalize_raw_info(raw)
         
         bids_path = BIDSPath(
@@ -1037,51 +1600,68 @@ def convert_raw_file(fif_path: Path, subject: str, session: Optional[str], task:
         else:
             logger.debug(f"    → Saved BIDS file: {bids_path.basename}")
         
-        conversion_stats.add_file(task, 'converted', fif_path.name)
+        conversion_stats.add_file(task, 'converted', fif_path.name)  # type: ignore[union-attr]
         
     except Exception as err:
         logger.error(f"  ✗ Conversion failed for {fif_path.name}: {err}")
-        conversion_stats.add_file(task, 'failed', fif_path.name)
+        conversion_stats.add_file(task, 'failed', fif_path.name)  # type: ignore[union-attr]
 
 
-def copy_derivative_file_with_proc(deriv_path: Path, subject: str, session: Optional[str], task: str, run: Optional[int], processing_label: str, derivatives_root: Path, split_index: Optional[int] = None, pipeline_name: str = 'maxfilter') -> None:
+def copy_derivative_file_with_proc(deriv_path: Path, subject: str, session: Optional[str], task: str, run: Optional[int], processing_label: str, derivatives_root: Path, acq: Optional[str] = None, pipeline_name: str = 'maxfilter') -> None:
     """
     Copy a derivative file to BIDS derivatives with proc label.
-    
+
     Uses standard BIDS naming:
-    - Single file: sub-<label>[_ses-<label>]_task-<label>[_run-<label>]_proc-<label>_meg.fif
-    - Split part: sub-<label>[_ses-<label>]_task-<label>[_run-<label>]_split-<index>_proc-<label>_meg.fif
-    
+    - Single file: sub-<label>[_ses-<label>]_task-<label>[_acq-<label>][_run-<label>]_proc-<label>_meg.fif
+    - Split part: sub-<label>[_ses-<label>]_task-<label>[_acq-<label>][_run-<label>]_split-<index>_proc-<label>_meg.fif
+
+    Split index is determined internally from the source filename pattern.
+
     Args:
         derivatives_root: Root derivatives directory (e.g., derivatives/<dataset>_derivatives/)
-        split_index: If provided, indicates this is a split part (0=primary, 1=first split, etc.)
+        acq: Optional acquisition label
     """
     deriv_root = derivatives_root / pipeline_name
     ensure_derivatives_description(deriv_root, pipeline_name, None)
-    
-    # Build BIDS path manually (works for both single and multi-label processing)
+
     if session:
         subdir = deriv_root / f"sub-{subject}" / f"ses-{session}" / 'meg'
     else:
         subdir = deriv_root / f"sub-{subject}" / 'meg'
-    
+
     subdir.mkdir(parents=True, exist_ok=True)
-    
-    # Build filename: sub-<label>[_ses-<label>]_task-<label>[_run-<index>][_split-<index>]_proc-<label>_meg.fif
+
+    # Determine split index from source filename
+    stem = deriv_path.stem
+    split_index = None
+
+    # Pattern 1: base-N_proc.fif -> split N+1 (e.g., -1 becomes split-02)
+    split_before_match = re.search(r'^(.+)-(\d+)_[a-zA-Z]', stem)
+    if split_before_match:
+        split_index = int(split_before_match.group(2)) + 1
+    else:
+        # Pattern 2: base_proc-N.fif -> split N+1
+        split_after_match = re.search(r'_[a-zA-Z][a-zA-Z_]*-(\d+)$', stem)
+        if split_after_match:
+            split_index = int(split_after_match.group(1)) + 1
+
+    # Build filename
     fname_parts = [f"sub-{subject}"]
     if session:
         fname_parts.append(f"ses-{session}")
     fname_parts.append(f"task-{task}")
+    if acq is not None:
+        fname_parts.append(f"acq-{acq}")
     if run is not None:
         fname_parts.append(f"run-{run:02d}")
     if split_index is not None:
-        fname_parts.append(f"split-{split_index+1:02d}")  # Convert 0-based to 1-based (1-indexed)
+        fname_parts.append(f"split-{split_index:02d}")
     fname_parts.append(f"proc-{processing_label}")
     fname_parts.append("meg.fif")
-    
+
     filename = "_".join(fname_parts)
     filepath = subdir / filename
-    
+
     shutil.copy2(deriv_path, filepath)
     logger.info(f"    → Copied to derivatives: {filepath.relative_to(deriv_root)}")
 
@@ -1114,12 +1694,14 @@ def convert_derivative_file(deriv_path: Path, subject: str, session: Optional[st
         raw_path, split_idx = raw_match_result
         
         # Copy derivative with standard BIDS naming (including split index if applicable)
-        copy_derivative_file_with_proc(deriv_path, subject, session, task, run, processing_label, derivatives_root, split_idx, pipeline_name)
-        conversion_stats.add_file(task, 'converted', deriv_path.name)
+        copy_derivative_file_with_proc(deriv_path, subject, session, task, run, processing_label, derivatives_root, pipeline_name=pipeline_name)
+        if conversion_stats is not None:
+            conversion_stats.add_file(task, 'converted', deriv_path.name)
         
     except Exception as err:
         logger.error(f"  ✗ Conversion failed for {deriv_path.name}: {err}")
-        conversion_stats.add_file(task, 'failed', deriv_path.name)
+        if conversion_stats is not None:
+            conversion_stats.add_file(task, 'failed', deriv_path.name)
 
 
 def auto_detect_sessions(source_dir: Path) -> List[Tuple[str, Optional[str]]]:
@@ -1912,11 +2494,18 @@ See README_MEG2BIDS.md for complete documentation.
         sessions = auto_detect_sessions(meg_folder)
         
         if not sessions:
-            logger.warning(f"  ⚠ No session directories found in {meg_folder}")
-            continue
+            if has_fif_files_in_folder(meg_folder):
+                logger.info(f"  ℹ Found FIF files directly in folder (legacy format without sessions)")
+                sessions = [(meg_folder.name, None)]
+            else:
+                logger.warning(f"  ⚠ No session directories found in {meg_folder}")
+                continue
         
         for folder_name, session_id in sessions:
-            sess_dir = meg_folder / folder_name
+            if folder_name == meg_folder.name and session_id is None:
+                sess_dir = meg_folder
+            else:
+                sess_dir = meg_folder / folder_name
             
             logger.info(f"\n{'─'*70}")
             if session_id:
@@ -1942,6 +2531,42 @@ See README_MEG2BIDS.md for complete documentation.
             
             logger.info(f"Found {len(all_fif_files)} FIF file(s) ({len(raw_files)} raw, {len(derivative_files)} derivatives)")
             
+            # Apply file exclusion patterns
+            exclude_patterns = config.get_exclude_patterns()
+            if exclude_patterns:
+                excluded_raw = []
+                kept_raw = []
+                for f in raw_files:
+                    matched = should_exclude_file(f.name, exclude_patterns)
+                    if matched:
+                        logger.info(f"  ⊗ Excluded (pattern: {matched}): {f.name}")
+                        conversion_stats.add_file('excluded', 'excluded', f.name)
+                        excluded_raw.append(f)
+                    else:
+                        kept_raw.append(f)
+                if excluded_raw:
+                    logger.info(f"  Excluded {len(excluded_raw)} raw file(s)")
+                raw_files = kept_raw
+
+                excluded_deriv = []
+                kept_deriv = []
+                for f in derivative_files:
+                    matched = should_exclude_file(f.name, exclude_patterns)
+                    if matched:
+                        logger.info(f"  ⊗ Excluded (pattern: {matched}): {f.name}")
+                        conversion_stats.add_file('excluded', 'excluded', f.name)
+                        excluded_deriv.append(f)
+                    else:
+                        kept_deriv.append(f)
+                if excluded_deriv:
+                    logger.info(f"  Excluded {len(excluded_deriv)} derivative file(s)")
+                derivative_files = kept_deriv
+            
+            # Deduplicate raw files based on FIF header fingerprint
+            raw_files, split_group_count = identify_primary_files(raw_files, interactive=False)
+            if split_group_count > 0:
+                logger.info(f"  ℹ Identified {split_group_count} split file group(s) from header deduplication")
+            
             # Detect and copy calibration files
             if config.get_calibration_auto_detect():
                 logger.info("\nDetecting Neuromag calibration files...")
@@ -1949,10 +2574,10 @@ See README_MEG2BIDS.md for complete documentation.
                 calibration_system = config.get_calibration_system()
                 meg_maxfilter_root = config.get_maxfilter_root()
                 if meg_maxfilter_root:
-                    calib_files = detect_calibration_files(meg_folder, folder_name, meg_maxfilter_root, calibration_system)
+                    calib_files = detect_calibration_files(meg_folder, folder_name, meg_maxfilter_root, calibration_system, raw_fif_files=all_fif_files)
                 else:
                     logger.warning("  ⚠ maxfilter_root not found in config or directory does not exist")
-                    calib_files = {'crosstalk': None, 'calibration': None}
+                    calib_files: Dict[str, Optional[Path]] = {'crosstalk': None, 'calibration': None}
                 
                 if calib_files['crosstalk'] or calib_files['calibration']:
                     copy_calibration_files(calib_files, bids_subject.replace('sub-', ''), session_id, bids_root, config.get_datatype())
@@ -1980,7 +2605,7 @@ See README_MEG2BIDS.md for complete documentation.
                     continue
             
                 file_pattern_map = validate_all_files(primary_raw_files, file_patterns)
-                task_files = group_files_by_task(file_pattern_map)
+                task_files = group_files_by_task(file_pattern_map, meg_id=meg_id)
                 file_mapping = assign_run_numbers(task_files)
                 
                 # Print conversion plan
@@ -2068,32 +2693,94 @@ See README_MEG2BIDS.md for complete documentation.
                     if not derivative_files:
                         logger.info("  ℹ No MaxFilter derivatives found")
                     
-                    for deriv_path in derivative_files:
+                    pipeline_name = config.get_pipeline_name() or 'maxfilter'
+                    
+                    # Detect split groups among derivatives
+                    deriv_split_groups, deriv_split_parts = detect_derivative_split_files(derivative_files)
+                    
+                    # Process primary derivative files (non-split-part files)
+                    primary_deriv_files = [f for f in derivative_files if f not in deriv_split_parts]
+                    
+                    for deriv_path in primary_deriv_files:
                         deriv_info = extract_derivative_info(deriv_path.name)
                         if not deriv_info:
                             continue
                         
+                        # Critical fix (f65e434): match using base_filename, not deriv_path.name
                         base_filename, proc_label = deriv_info
-                        raw_match_result = find_matching_raw_file(deriv_path.name, raw_files, split_file_groups)
+                        matched_pattern = match_file_pattern(base_filename, file_patterns)
                         
                         task = None
                         run = None
+                        acq = None
                         
-                        if raw_match_result and raw_match_result[0] in file_mapping:
-                            # Derivative has matching raw file - use its metadata
-                            task, run, _ = file_mapping[raw_match_result[0]]
+                        if matched_pattern:
+                            task = matched_pattern.get('task')
+                            run_extraction = matched_pattern.get('run_extraction', 'last_digits')
+                            run = extract_run_from_filename(base_filename, run_extraction, meg_id=meg_id)
+                            # Extract acq: static string or dynamic method
+                            acq_config = matched_pattern.get('acq')
+                            if acq_config and acq_config not in ('last_digits', 'first_digits'):
+                                acq = acq_config
+                            elif acq_config in ('last_digits', 'first_digits'):
+                                acq = extract_run_from_filename(base_filename, acq_config, meg_id=meg_id)
+                                if acq is not None:
+                                    acq = str(acq)
                         else:
-                            # No matching raw file - try to infer task from base filename
                             task = infer_task_from_basename(base_filename, file_patterns)
                             if task:
                                 logger.debug(f"  Inferred task='{task}' for {deriv_path.name} from base filename {base_filename}")
                         
-                        if task and raw_match_result:
-                            convert_derivative_file(deriv_path, bids_subject.replace('sub-', ''), session_id, task, run, config, proc_label, args.derivatives_root, raw_files, split_file_groups)
-                        elif not raw_match_result:
-                            logger.warning(f"  ⚠ {deriv_path.name}: No corresponding raw file found (skipped)")
+                        if task:
+                            logger.info(f"  ✓ Converting derivative: {deriv_path.name} → task={task} (proc-{proc_label})")
+                            copy_derivative_file_with_proc(
+                                deriv_path, bids_subject.replace('sub-', ''), session_id, task, run,
+                                proc_label, args.derivatives_root, acq=acq, pipeline_name=pipeline_name
+                            )
+                            conversion_stats.add_file('success', task, deriv_path.name)
                         else:
                             logger.warning(f"  ✗ {deriv_path.name}: Could not determine task (skipped)")
+                            conversion_stats.add_file('skipped', 'unknown', deriv_path.name)
+                    
+                    # Process split derivative groups
+                    for primary_split_path, split_files in deriv_split_groups.items():
+                        split_deriv_info = extract_derivative_info(primary_split_path.name)
+                        if not split_deriv_info:
+                            continue
+                        split_base_filename, proc_label = split_deriv_info
+                        # Strip any split suffix to get the true base name for pattern matching
+                        base_name, _ = _extract_base_name_and_suffix(split_base_filename, with_proc=False)
+                        # Match using base_name (without proc suffix) for task lookup
+                        matched_pattern = match_file_pattern(base_name + '.fif', file_patterns)
+                        
+                        task = None
+                        run = None
+                        acq = None
+                        
+                        if matched_pattern:
+                            task = matched_pattern.get('task')
+                            run_extraction = matched_pattern.get('run_extraction', 'last_digits')
+                            run = extract_run_from_filename(base_name + '.fif', run_extraction, meg_id=meg_id)
+                            acq_config = matched_pattern.get('acq')
+                            if acq_config and acq_config not in ('last_digits', 'first_digits'):
+                                acq = acq_config
+                            elif acq_config in ('last_digits', 'first_digits'):
+                                acq = extract_run_from_filename(base_name + '.fif', acq_config, meg_id=meg_id)
+                                if acq is not None:
+                                    acq = str(acq)
+                        else:
+                            task = infer_task_from_basename(base_name + '.fif', file_patterns)
+                        
+                        if task:
+                            for split_file in split_files:
+                                logger.info(f"  ✓ Converting derivative split: {split_file.name} → task={task} (proc-{proc_label})")
+                                copy_derivative_file_with_proc(
+                                    split_file, bids_subject.replace('sub-', ''), session_id, task, run,
+                                    proc_label, args.derivatives_root, acq=acq, pipeline_name=pipeline_name
+                                )
+                                conversion_stats.add_file('success', task, split_file.name)
+                        else:
+                            logger.warning(f"  ✗ Derivative split group {base_name}/{proc_label}: Could not determine task (skipped)")
                 else:
                     logger.debug("  ℹ Skipping derivatives (pipeline_name set to 'none' in config)")
             

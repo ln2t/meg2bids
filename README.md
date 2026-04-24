@@ -16,8 +16,11 @@ Your friendly MEG to BIDS converter.
 - ✅ Automatic MaxFilter derivative detection and organization
 - ✅ Split file support (files > 2GB)
 - ✅ Calibration file management (crosstalk and fine-calibration)
-- ✅ Session auto-detection
+- ✅ Session auto-detection (including legacy format — FIF files directly in subject folder)
 - ✅ Multi-subject batch processing
+- ✅ File exclusion via wildcard patterns
+- ✅ FIF header deduplication (removes duplicate recordings automatically)
+- ✅ Acquisition label (`acq`) support in file patterns
 
 **Note**: Currently supports only FIF format from Neuromag/Elekta/MEGIN systems. Support for other MEG manufacturers (CTF, BTI/4D, KIT/Yokogawa) may be added in future releases.
 
@@ -105,7 +108,11 @@ Create `meg2bids.json` in your configs directory:
   "options": {
     "allow_maxshield": true,
     "overwrite": true
-  }
+  },
+  "exclude_patterns": [
+    "*empty_room*",
+    "*noise*"
+  ]
 }
 ```
 
@@ -159,13 +166,33 @@ Example: `restingstate_mc_ave.fif` → `sub-01_task-rest_proc-mc-ave_meg.fif`
 ### Calibration File Management
 
 Automatically detects and copies calibration files:
-- **Crosstalk**: `ct_sparse_triux2.fif` (Triux) or `ct_sparse_vectorview.fif` (VectorView)
-- **Fine-calibration**: `sss_cal_XXXX_*.dat` (date-matched) or `sss_cal_vectorview.dat`
+- **Crosstalk**: `ct_sparse_triux2.fif` (Triux) or `ct_sparse_erasme_enm.fif` (VectorView)
+- **Fine-calibration**: `sss_cal_XXXX_*.dat` (date-matched to session) or `sss_cal_erasme_enm.dat` (VectorView)
+
+The session date is extracted from the session folder name (YYMMDD format). If no date is found in the folder name, it falls back to reading the measurement date from the FIF header.
 
 ### Split File Handling
 
 Handles large files automatically split by the acquisition system:
 - `filename.fif`, `filename-1.fif`, `filename-2.fif` → Single BIDS entry
+
+Derivative split files are also handled:
+- Pattern 1 (split before proc): `file.fif`, `file-1_sss.fif`, `file-2_sss.fif`
+- Pattern 2 (split after proc): `file_sss-1.fif`, `file_sss-2.fif`
+
+### File Exclusion
+
+Exclude specific files using wildcard patterns in the config:
+
+```json
+"exclude_patterns": ["*empty_room*", "*noise*", "*test*"]
+```
+
+Excluded files are reported in the conversion summary with an `⊗ Excluded` marker.
+
+### FIF Header Deduplication
+
+When the same recording is stored multiple times (e.g., backup copies), `meg2bids` automatically detects duplicates by comparing FIF header fingerprints and keeps only one copy per recording.
 
 ## 🗂️ Output Structure
 
