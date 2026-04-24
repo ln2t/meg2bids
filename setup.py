@@ -26,7 +26,7 @@ else:
 
 setup(
     name="meg2bids",
-    version="1.0.0",
+    version="1.1.0",
     description="MEG to BIDS converter for Neuromag/Elekta/MEGIN FIF files",
     long_description=long_description,
     long_description_content_type="text/markdown",

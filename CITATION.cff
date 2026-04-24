@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: "meg2bids: MEG to BIDS Converter"
-version: 1.0.0
+version: 1.1.0
 date-released: 2026-01-21
 authors:
   - family-names: "Vandermiers"
